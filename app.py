@@ -1,10 +1,11 @@
+
+
 """
-Streamlit + Folium Delivery Route Optimizer
-Features:
+Streamlit + Folium Delivery Route Optimizer (local-only)
 - Upload CSV with delivery points (id, lat, lon, [address])
 - Cluster orders into k zones (KMeans)
 - Compute routes per driver using Nearest Neighbor + 2-opt improvement
-- "Quantum" mode runs a stronger 2-opt + random-restart heuristic (quantum-inspired)
+- "Quantum (inspired)" mode uses multi-restart double-bridge + simulated annealing (no cloud)
 - Show map with markers and polylines via Folium (embedded using streamlit_folium)
 - Add traffic-jam points to increase nearby distances (simulate rerouting)
 - Environmental impact: distance, fuel saved estimate, CO2 saved estimate
@@ -22,6 +23,19 @@ import base64
 import math
 import time
 import random
+# --- Safe Sampler Shim ---
+# Ensures we never hit D-Wave API, always fall back to local solver
+def get_sampler():
+    try:
+        from neal import SimulatedAnnealingSampler
+        return SimulatedAnnealingSampler()
+    except ImportError:
+        import dimod
+        return dimod.ExactSolver()
+
+# Replace LeapHybridSampler reference globally
+LeapHybridSampler = get_sampler
+
 
 st.set_page_config(page_title="Quantum Delivery Command Center (Demo)", layout="wide")
 
@@ -29,7 +43,6 @@ st.set_page_config(page_title="Quantum Delivery Command Center (Demo)", layout="
 # Utility functions
 # -------------------------
 def haversine(lat1, lon1, lat2, lon2):
-    # returns distance in km between two lat/lon
     R = 6371.0
     phi1 = math.radians(lat1); phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1); dlambda = math.radians(lon2 - lon1)
@@ -37,18 +50,16 @@ def haversine(lat1, lon1, lat2, lon2):
     return 2*R*math.asin(math.sqrt(a))
 
 def pairwise_distance_matrix(points, traffic_jams=None, jam_influence_km=2.0, jam_penalty_factor=2.0):
-    # points: list of (lat, lon)
     n = len(points)
     mat = [[0.0]*n for _ in range(n)]
     for i in range(n):
         for j in range(n):
-            if i==j: mat[i][j]=0.0
+            if i==j:
+                mat[i][j] = 0.0
             else:
                 d = haversine(points[i][0], points[i][1], points[j][0], points[j][1])
-                # If traffic_jams present, increase distance if segment passes near jam (approx)
                 if traffic_jams:
                     for jam in traffic_jams:
-                        # if either endpoint within influence, increase cost
                         if haversine(points[i][0], points[i][1], jam[0], jam[1]) <= jam_influence_km or \
                            haversine(points[j][0], points[j][1], jam[0], jam[1]) <= jam_influence_km:
                             d *= jam_penalty_factor
@@ -63,7 +74,6 @@ def route_length(route, distmat):
     return s
 
 def nearest_neighbor_tour(start_idx, indices, distmat):
-    # start at start_idx, visit all indices (list) returning a route (list of indices)
     unvisited = set(indices)
     route = [start_idx]
     current = start_idx
@@ -74,19 +84,20 @@ def nearest_neighbor_tour(start_idx, indices, distmat):
         route.append(nxt)
         unvisited.remove(nxt)
         current = nxt
-    # return to start
     route.append(start_idx)
     return route
 
-def two_opt(route, distmat, improvement_threshold=0.0001):
+def two_opt(route, distmat, improvement_threshold=1e-6):
     best = route[:]
     improved = True
     best_distance = route_length(best, distmat)
     while improved:
         improved = False
-        for i in range(1, len(best)-3):
-            for j in range(i+1, len(best)-2):
-                if j-i == 1: continue
+        n = len(best)
+        for i in range(1, n-3):
+            for j in range(i+1, n-2):
+                if j - i == 1:
+                    continue
                 new_route = best[:i] + best[i:j+1][::-1] + best[j+1:]
                 new_dist = route_length(new_route, distmat)
                 if new_dist + improvement_threshold < best_distance:
@@ -97,7 +108,6 @@ def two_opt(route, distmat, improvement_threshold=0.0001):
     return best
 
 def save_routes_to_csv(routes, points_df, depot_lat, depot_lon):
-    # routes: dict driver_id -> list of point indices in order (including depot index 0)
     rows = []
     for drv, route in routes.items():
         for seq, idx in enumerate(route):
@@ -111,7 +121,7 @@ def save_routes_to_csv(routes, points_df, depot_lat, depot_lon):
                     "address": "Depot"
                 })
             else:
-                src_idx = idx - 1  # adjust from all_points index to points_df index
+                src_idx = idx - 1  # convert from all_points index to points_df index
                 id_val = points_df.iloc[src_idx]["id"] if "id" in points_df.columns else src_idx
                 lat_val = points_df.iloc[src_idx]["lat"]
                 lon_val = points_df.iloc[src_idx]["lon"]
@@ -125,13 +135,13 @@ def save_routes_to_csv(routes, points_df, depot_lat, depot_lon):
                     "address": addr_val
                 })
     return pd.DataFrame(rows)
+
 def double_bridge_move(route):
     # route must start/end at depot (index 0). keep endpoints fixed.
-    if len(route) < 8: 
-        return route[:]  # too small
+    if len(route) < 8:
+        return route[:]
     n = len(route) - 1
     a, b, c, d = sorted(random.sample(range(1, n), 4))
-    # 4-edge cut and reconnect (Lin–Kernighan style)
     part1 = route[1:a]
     part2 = route[a:b]
     part3 = route[b:c]
@@ -140,68 +150,92 @@ def double_bridge_move(route):
     new_mid = part1 + part3 + part2 + part4 + tail
     return [0] + new_mid + [0]
 
-def simulated_annealing(route, distmat, T0=1.0, alpha=0.995, iters=1500):
-    # safeguard: too few nodes → nothing to optimize
+def simulated_annealing(route, distmat, T0=1.0, alpha=0.995, iters=1000):
     if len(route) <= 3:
         return route[:]
-
     best = route[:]
     best_len = route_length(best, distmat)
     cur = route[:]
     cur_len = best_len
     T = T0
-
     for _ in range(iters):
-        if len(cur) <= 3:
-            break  # extra safety
-
+        if len(cur) <= 3: break
         i, j = sorted(random.sample(range(1, len(cur)-1), 2))
-        # 2-opt style neighbor (segment reversal)
         cand = cur[:i] + cur[i:j+1][::-1] + cur[j+1:]
         cand_len = route_length(cand, distmat)
-
         if cand_len < cur_len or random.random() < math.exp((cur_len - cand_len)/max(1e-9, T)):
             cur, cur_len = cand, cand_len
             if cur_len < best_len:
                 best, best_len = cur, cur_len
-
         T *= alpha
         if T < 1e-6:
             T = 1e-6
-
     return best
 
-
+# -------------------------
+# Optimizers
+# -------------------------
 def optimize_route_classical(cluster_indices, distmat):
     route = nearest_neighbor_tour(0, cluster_indices, distmat)
     route = two_opt(route, distmat)
     return route
 
-def optimize_route_quantum(cluster_indices, distmat, effort=12, time_limit_s=1.5):
-    # Multi-start + tunneling + SA + 2-opt
-    deadline = time.time() + time_limit_s
-    best = None
+def optimize_route_quantum_inspired(cluster_indices, distmat, effort=16, time_limit_s=2.5, random_seed=None):
+    """
+    Quantum-inspired local-search:
+    - Multi-restart (effort restarts)
+    - For each restart: nearest neighbor -> apply random double-bridge move(s) -> local simulated annealing -> 2-opt
+    - Time capped by time_limit_s (seconds)
+    Returns best route found (list of all_points indices, starting/ending with 0).
+    """
+    if random_seed is not None:
+        random.seed(random_seed)
+    start_time = time.time()
+    best_route = None
     best_len = float("inf")
-    n = len(cluster_indices)
-    # at least 'effort' restarts; also respect time limit
-    restarts = 0
-    while restarts < effort or time.time() < deadline:
-        # random start
-        route = [0] + random.sample(cluster_indices, n) + [0]
-        # a few "quantum kicks" (double-bridge moves) to jump basins
-        for _ in range(max(1, n//4)):
-            route = double_bridge_move(route)
-        # anneal in this basin
-        route = simulated_annealing(route, distmat, T0=max(0.5, n/20), alpha=0.998, iters=1000 + 30*n)
-        # local polish
-        route = two_opt(route, distmat)
-        l = route_length(route, distmat)
-        if l < best_len:
-            best, best_len = route, l
-        restarts += 1
-        if time.time() > deadline:
+
+    # convert cluster_indices to be present (list of ints in all_points indexing)
+    if not cluster_indices:
+        return [0, 0]
+
+    # Ensure deterministic-ish nearest neighbor start selection variations
+    for attempt in range(max(1, effort)):
+        if time.time() - start_time > time_limit_s:
             break
-    return best
+        # choose a random start among cluster indices to diversify
+        start_idx = random.choice(cluster_indices)
+        route = nearest_neighbor_tour(start_idx, cluster_indices, distmat)
+        # normalize: ensure route begins at depot (0), if start_idx != 0 (nearest returns start->...->start->)
+        if route[0] != 0:
+            # rotate so depot 0 at beginning; if depot not present, add it
+            if 0 not in route:
+                route = [0] + route[1:] + [0]
+            else:
+                # rotate to put 0 at front
+                idx0 = route.index(0)
+                route = route[idx0:] + route[1:idx0+1]
+
+        # apply random double-bridge moves a few times based on effort
+        n_db = max(1, effort // 8)
+        for _ in range(n_db):
+            route = double_bridge_move(route)
+
+        # run simulated annealing local search with iterations scaled by effort
+        iters = 800 + int((effort/60.0) * 2000)
+        route = simulated_annealing(route, distmat, T0=1.0, alpha=0.995, iters=iters)
+
+        # finish with a two-opt polish
+        route = two_opt(route, distmat)
+
+        route_len = route_length(route, distmat)
+        if route_len < best_len:
+            best_len = route_len
+            best_route = route
+
+    # fallback guarantee
+    if best_route is None:
+        best_route = [0] + cluster_indices + [0]
+    return best_route
 
 # -------------------------
 # UI - Sidebar
@@ -215,7 +249,7 @@ uploaded_file = st.sidebar.file_uploader("Drop CSV file here or click to upload"
 num_drivers = st.sidebar.number_input("Number of drivers / delivery boys", min_value=1, max_value=50, value=3)
 optimization_mode = st.sidebar.radio("Optimization Mode", ("Classical", "Quantum (inspired)"))
 quantum_effort = st.sidebar.slider("Quantum effort (restarts)", 4, 60, 16, help="Higher = slower but better")
-quantum_time   = st.sidebar.slider("Quantum time cap (seconds)", 1.0, 8.0, 2.5)
+quantum_time   = st.sidebar.slider("Quantum time cap (seconds)", 1.0, 12.0, 3.0)
 depot_lat = st.sidebar.number_input("Depot latitude", value=15.8281, format="%.6f")
 depot_lon = st.sidebar.number_input("Depot longitude", value=78.0373, format="%.6f")
 fuel_l_per_km = st.sidebar.number_input("Fuel consumption (L/km)", min_value=0.01, value=0.12, format="%.3f")
@@ -268,12 +302,12 @@ with col1:
 
 with col2:
     st.header("Map — Optimization View")
-    # Setup map
+    # Setup map (light/white theme)
     map_center = [depot_lat, depot_lon]
-    m = folium.Map(location=map_center, zoom_start=13, tiles="CartoDB dark_matter")
+    m = folium.Map(location=map_center, zoom_start=13, tiles="CartoDB positron")
 
-    # Add depot marker
-    folium.CircleMarker(location=map_center, radius=8, color="cyan", fill=True, fill_color="cyan",
+    # Add depot marker (light styling)
+    folium.CircleMarker(location=map_center, radius=8, color="#0077b6", fill=True, fill_color="#00b4d8",
                         tooltip="Depot").add_to(m)
 
     # If no CSV, show only map
@@ -287,7 +321,6 @@ with col2:
         if add_random_traffic:
             rng = np.random.RandomState(42)
             for i in range(n_random_jams):
-                # sample within bounding box of points
                 lats = [p[0] for p in points] + [depot_lat]
                 lons = [p[1] for p in points] + [depot_lon]
                 lat = float(rng.uniform(min(lats), max(lats)))
@@ -329,8 +362,6 @@ with col2:
         total_optimized_distance = 0.0
         baseline_total_distance = 0.0
 
-        # baseline naive: sequential assignment of points to drivers by cluster order, route is depot->everypt->depot without optimization
-        # We'll compute baseline per cluster as depot -> cluster points in given order -> depot
         for cluster_id in range(k):
             cluster_indices_local = [i for i, lbl in enumerate(labels) if lbl == cluster_id]  # indices in points (0-based)
             cluster_indices = [i+1 for i in cluster_indices_local]  # convert to all_points index
@@ -345,7 +376,7 @@ with col2:
 
             # Choose optimizer
             if optimization_mode == "Quantum (inspired)":
-                final_route = optimize_route_quantum(cluster_indices, distmat, effort=quantum_effort, time_limit_s=quantum_time)
+                final_route = optimize_route_quantum_inspired(cluster_indices, distmat, effort=quantum_effort, time_limit_s=quantum_time)
             else:
                 final_route = optimize_route_classical(cluster_indices, distmat)
 
@@ -398,6 +429,6 @@ with col2:
         href = f'<a href="data:file/csv;base64,{b64}" download="optimized_routes.csv">Download optimized routes CSV</a>'
         st.markdown(href, unsafe_allow_html=True)
 
-        st.info("Note: 'Quantum' mode here uses a quantum-inspired multi-restart + local search heuristic (simulated). "
-                "If you later integrate real quantum solvers (D-Wave/IBM Qiskit), replace the route optimizer step with a QUBO solver.")
+        st.info("Note: 'Quantum (inspired)' here is a local, quantum-inspired heuristic (multi-restart + double-bridge + simulated annealing). "
+                "It runs fully locally with no API key needed.")
 
